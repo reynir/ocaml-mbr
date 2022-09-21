@@ -1,0 +1,4 @@
+(executable
+ (public_name mbr-cat)
+ (name mbr_cat)
+ (libraries mbr cmdliner unix))
