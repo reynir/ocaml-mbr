@@ -1,27 +1,42 @@
-let sectors (part, free) =
+let sectors (part, size_spec) =
   let stats = Unix.stat part in
-  let free = match free with None -> 0 | Some free -> Int32.to_int free in
-  (stats.st_size + 511) / 512 + free
+  (* XXX: warn on misaligned data? *)
+  let data_sectors = (stats.st_size + 511) / 512 in
+  let size =
+    match size_spec with
+    | `All -> data_sectors
+    | `Free free -> data_sectors + free
+    | `Total size ->
+      if size < data_sectors then begin
+        Printf.eprintf "Partition size %d sectors for file '%S', but file is bigger" size part;
+        exit 1
+      end;
+      size
+  in
+  part, size
 
 let mbr_cat parts =
-  let sizes = List.map sectors parts in
+  let parts = List.map sectors parts in
   let partitions =
     List.fold_left
-      (fun r size ->
-         Result.bind r @@ fun (offset, acc) ->
-         Mbr.Partition.make ~ty:0x7F (Int32.of_int offset) (Int32.of_int size)
-         |> Result.map (fun partition -> offset + size, partition :: acc))
-      (Ok (1, []))
-      sizes
-    |> Result.map snd
-    |> Result.get_ok
+      (fun (offset, acc) (part, size) ->
+         match Mbr.Partition.make ~ty:0x7F (Int32.of_int offset) (Int32.of_int size) with
+         | Error e -> Printf.eprintf "Error creating partition for %s: %s" part e; exit 1
+         | Ok partition -> offset + size, partition :: acc)
+      (1, [])
+      parts
+    |> snd
   in
-  let mbr = Mbr.make partitions |> Result.get_ok in
+  let mbr =
+    match Mbr.make partitions with
+    | Error e -> Printf.eprintf "Partitioning error: %s" e; exit 2
+    | Ok mbr -> mbr
+  in
   let hdr = Cstruct.create 512 in
   Mbr.marshal hdr mbr;
   output_string stdout (Cstruct.to_string hdr);
   let empty_block = String.init 512 (Fun.const '\000') in
-  List.iter (fun (f, free) ->
+  List.iter (fun (f, size) ->
       let ic = open_in f in
       let buf = Bytes.create 512 in
       let rec loop written =
@@ -35,12 +50,9 @@ let mbr_cat parts =
       let written = loop 0 in
       if written land 511 <> 0 then
         output_string stdout (String.init (512 - written land 511) (Fun.const '\000'));
-      match free with
-      | None -> ()
-      | Some free ->
-        for _ = 1 to Option.get (Int32.unsigned_to_int free) do
-          output_string stdout empty_block
-        done)
+      for _ = 1 to size - (written + 511) / 512 do
+        output_string stdout empty_block
+      done)
     parts
 
 let jump parts =
@@ -51,38 +63,55 @@ let jump parts =
 open Cmdliner
 
 let part_conv =
+  let docv = "PART[::[SIZE|+FREE]]" in
   let parse s =
     let (let*) = Result.bind in
     match String.split_on_char ':' s with
     | [ part ] ->
       let* part = Arg.conv_parser Arg.non_dir_file part in
-      Ok (part, None)
-    | [ part ; "" ; free ] ->
+      Ok (part, `All)
+    | [ part ; "" ; sectors_s ] ->
       let* part = Arg.conv_parser Arg.non_dir_file part in
-      let* free = Arg.conv_parser Arg.int32 free in
-      Ok (part, Some free)
+      let* sectors = Arg.conv_parser Arg.int sectors_s in
+      let* () =
+        if 0xFFFFFFFF land sectors <> sectors then
+          Error (`Msg (Printf.sprintf "invalid value '%S', expected uint32 value" sectors_s))
+        else Ok ()
+      in
+      if sectors_s.[0] = '+' then
+        Ok (part, `Free sectors)
+      else
+        Ok (part, `Total sectors)
     | _ ->
-      Error (`Msg "expected format is PART[::FREE]")
+      Error (`Msg ("expected format is " ^ docv))
   in
   let print ppf = function
-    | part, None ->
+    | part, `All ->
       Arg.conv_printer Arg.non_dir_file ppf part
-    | part, Some free ->
+    | part, `Free free ->
+      Format.fprintf ppf "%a::+%a"
+        Arg.(conv_printer non_dir_file) part
+        Arg.(conv_printer int) free
+    | part, `Total size ->
       Format.fprintf ppf "%a::%a"
         Arg.(conv_printer non_dir_file) part
-        Arg.(conv_printer int32) free
+        Arg.(conv_printer int) size
   in
-  Arg.conv ~docv:"PART[::FREE]" (parse, print)
+  Arg.conv ~docv (parse, print)
 
 let parts =
-  let doc = Printf.sprintf "Contents of the partition and optional free space. \
+  let doc = Printf.sprintf "Contents of the partition and optional size specification. \
                             At most four partitions may be specified." in
-  let docv = "PART[::FREE]" in
+  let docv = "PART[::[SIZE|+FREE]]" in
   Arg.(value & pos_all part_conv [] & info [] ~doc ~docv)
 
 let cmd =
   let doc = "Concatenate files into a MBR partitioned file" in
-  let info = Cmd.info "mbr-cat" ~version:"%%VERSION%%" ~doc in
+  let exits =
+    Cmd.Exit.info 1 ~max:2 ~doc:"on partition error" ::
+    Cmd.Exit.defaults
+  in
+  let info = Cmd.info "mbr-cat" ~version:"%%VERSION%%" ~doc ~exits in
   Cmd.v info Term.(ret (const jump $ parts))
 
 let () = exit (Cmd.eval cmd)
