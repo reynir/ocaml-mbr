@@ -15,7 +15,7 @@ let sectors (part, size_spec) =
   in
   part, size
 
-let mbr_cat parts =
+let mbr_cat mbr_padding parts =
   let parts = List.map sectors parts in
   let partitions =
     List.fold_left
@@ -23,7 +23,7 @@ let mbr_cat parts =
          match Mbr.Partition.make ~ty:0x7F (Int32.of_int offset) (Int32.of_int size) with
          | Error e -> Printf.eprintf "Error creating partition for %s: %s" part e; exit 1
          | Ok partition -> offset + size, partition :: acc)
-      (1, [])
+      (1 + mbr_padding, [])
       parts
     |> snd
   in
@@ -36,6 +36,9 @@ let mbr_cat parts =
   Mbr.marshal hdr mbr;
   output_string stdout (Cstruct.to_string hdr);
   let empty_block = String.init 512 (Fun.const '\000') in
+  for _ = 1 to mbr_padding do
+    output_string stdout empty_block
+  done;
   List.iter (fun (f, size) ->
       let ic = open_in f in
       let buf = Bytes.create 512 in
@@ -55,12 +58,22 @@ let mbr_cat parts =
       done)
     parts
 
-let jump parts =
+let jump mbr_padding parts =
   if List.length parts > 4
   then `Help (`Auto, None)
-  else `Ok (mbr_cat parts)
+  else `Ok (mbr_cat mbr_padding parts)
 
 open Cmdliner
+
+let uint32_conv =
+  let (let*) = Result.bind in
+  let parse s =
+    let* v = Arg.conv_parser Arg.int s in
+    if 0xFFFF_FFFF land v <> v then
+      Error (`Msg (Printf.sprintf "invalid value '%S', expected uint32 value" s))
+    else Ok v
+  and print = Arg.conv_printer Arg.int in
+  Arg.conv (parse, print)
 
 let part_conv =
   let docv = "PART[::[SIZE|+FREE]]" in
@@ -72,12 +85,7 @@ let part_conv =
       Ok (part, `All)
     | [ part ; "" ; sectors_s ] ->
       let* part = Arg.conv_parser Arg.non_dir_file part in
-      let* sectors = Arg.conv_parser Arg.int sectors_s in
-      let* () =
-        if 0xFFFFFFFF land sectors <> sectors then
-          Error (`Msg (Printf.sprintf "invalid value '%S', expected uint32 value" sectors_s))
-        else Ok ()
-      in
+      let* sectors = Arg.conv_parser uint32_conv sectors_s in
       if sectors_s.[0] = '+' then
         Ok (part, `Free sectors)
       else
@@ -100,10 +108,15 @@ let part_conv =
   Arg.conv ~docv (parse, print)
 
 let parts =
-  let doc = Printf.sprintf "Contents of the partition and optional size specification. \
-                            At most four partitions may be specified." in
+  let doc = "Contents of the partition and optional size specification. \
+             At most four partitions may be specified." in
   let docv = "PART[::[SIZE|+FREE]]" in
   Arg.(value & pos_all part_conv [] & info [] ~doc ~docv)
+
+let mbr_padding =
+  let doc = "Number of unused sectors after the Master Boot Record." in
+  let docv = "MBR-PADDING" in
+  Arg.(value & opt uint32_conv 0 & info ["mbr-padding"] ~doc ~docv)
 
 let cmd =
   let doc = "Concatenate files into a MBR partitioned file" in
@@ -112,6 +125,6 @@ let cmd =
     Cmd.Exit.defaults
   in
   let info = Cmd.info "mbr-cat" ~version:"%%VERSION%%" ~doc ~exits in
-  Cmd.v info Term.(ret (const jump $ parts))
+  Cmd.v info Term.(ret (const jump $ mbr_padding $ parts))
 
 let () = exit (Cmd.eval cmd)

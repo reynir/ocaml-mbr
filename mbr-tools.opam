@@ -1,0 +1,23 @@
+opam-version: "2.0"
+maintainer:   "Reynir Björnsson <reynir@reynir.dk>"
+authors:      "Reynir Björnsson <reynir@reynir.dk>"
+homepage:     "https://github.com/mirage/ocaml-mbr"
+bug-reports:  "https://github.com/mirage/ocaml-mbr/issues"
+dev-repo:     "git+https://github.com/mirage/ocaml-mbr.git"
+build: [
+  ["dune" "subst"] {dev}
+  ["dune" "build" "-p" name "-j" jobs]
+  ["dune" "runtest" "-p" name "-j" jobs] {with-test}
+]
+depends: [
+  "ocaml" {>= "4.08.0"}
+  "dune"
+  "lwt"
+  "cstruct" {>= "6.0.0"}
+  "ppx_cstruct"
+  "cmdliner"
+  "mbr-format" {= version}
+  "fmt" {with-test}
+  "alcotest" {with-test}
+]
+synopsis: "Tools for manipulating files with Master Boot Records"
